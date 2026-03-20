@@ -59,7 +59,7 @@ if(WIN32)
 endif()
 
 if (APPLE)
-    target_link_libraries(qwen3asr PRIVATE "-framework Accelerate")
+    target_link_libraries(qwen3-asr PRIVATE "-framework Accelerate")
 endif ()
 
 target_include_directories(qwen3-asr PRIVATE
