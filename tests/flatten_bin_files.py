@@ -28,7 +28,7 @@ def flatten_files(input_dir: str, target_dir: str):
             except Exception as e:
                 print(f"skip {src_file}: {str(e)}")
 
-    print("\n🎉 Flattening complete! All files have been copied to:", target_dir)
+    print("\nFlattening complete! All files have been copied to:", target_dir)
 
 if __name__ == "__main__":
     if len(sys.argv) != 3:

@@ -35,7 +35,7 @@ jobs:
 
             -   name: Compile
                 run: |
-                    cmake -B build -S . -DCMAKE_BUILD_TYPE=Release -DGGML_VULKAN=${matrix.ggml_vulkan}
+                    cmake -B build -S . -DCMAKE_BUILD_TYPE=Release -DGGML_VULKAN=${{ matrix.ggml_vulkan }}
                     cmake --build build --config Release
                     python tests/flatten_bin_files.py build bin
 
@@ -119,8 +119,9 @@ jobs:
                     curl -L -o assets/jfk.wav https://raw.githubusercontent.com/ggml-org/whisper.cpp/refs/heads/master/samples/jfk.wav
 
             -   name: Compile
+                shell: bash
                 run: |
-                    cmake -B build -S . -DCMAKE_BUILD_TYPE=Release -DGGML_VULKAN=${matrix.ggml_vulkan}
+                    cmake -B build -S . -DCMAKE_BUILD_TYPE=Release -DGGML_VULKAN=${{ matrix.ggml_vulkan }}
                     cmake --build build --config Release
                     python tests/flatten_bin_files.py build bin
 
