@@ -26,6 +26,7 @@ struct cli_params {
     bool align_mode = false;
     bool transcribe_align_mode = false;
     bool profile = false;
+    bool output_srt = false;
 };
 
 static void print_usage(const char * prog) {
@@ -50,6 +51,9 @@ static void print_usage(const char * prog) {
     fprintf(stderr, "Transcribe + Align:\n");
     fprintf(stderr, "  -a, --transcribe-align Run ASR then forced alignment\n");
     fprintf(stderr, "  --aligner-model <path> Path to forced aligner GGUF model (required with --transcribe-align)\n");
+    fprintf(stderr, "\n");
+    fprintf(stderr, "Output Formats:\n");
+    fprintf(stderr, "  -osrt, --output-srt    Output result in a SRT file\n");
     fprintf(stderr, "\n");
     fprintf(stderr, "  -h, --help             Show this help message\n");
     fprintf(stderr, "\n");
@@ -114,6 +118,8 @@ static bool parse_args(int argc, char ** argv, cli_params & params) {
             params.profile = true;
         } else if (strcmp(arg, "--align") == 0) {
             params.align_mode = true;
+        } else if (strcmp(arg, "-osrt") == 0 || strcmp(arg, "--output-srt") == 0) {
+            params.output_srt = true;
         } else if (strcmp(arg, "-a") == 0 || strcmp(arg, "--transcribe-align") == 0) {
             params.transcribe_align_mode = true;
         } else if (strcmp(arg, "--aligner-model") == 0) {
@@ -254,11 +260,11 @@ static std::string escape_json_string(const std::string & s) {
 
 static std::string alignment_to_json(const qwen3_asr::alignment_result & result) {
     std::string json = "{\n  \"words\": [\n";
-    
+
     for (size_t i = 0; i < result.words.size(); ++i) {
         const auto & w = result.words[i];
         char buf[256];
-        snprintf(buf, sizeof(buf), 
+        snprintf(buf, sizeof(buf),
                  "    {\"word\": \"%s\", \"start\": %.3f, \"end\": %.3f}",
                  escape_json_string(w.word).c_str(), w.start, w.end);
         json += buf;
@@ -267,9 +273,40 @@ static std::string alignment_to_json(const qwen3_asr::alignment_result & result)
         }
         json += "\n";
     }
-    
+
     json += "  ]\n}";
     return json;
+}
+
+static std::string to_timestamp(double t_sec, bool comma = false) {
+    int64_t msec = static_cast<int64_t>(t_sec * 1000.0);
+    int64_t hr = msec / (1000 * 60 * 60);
+    msec = msec - hr * (1000 * 60 * 60);
+    int64_t min = msec / (1000 * 60);
+    msec = msec - min * (1000 * 60);
+    int64_t sec = msec / 1000;
+    msec = msec - sec * 1000;
+
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%02d:%02d:%02d%s%03d", (int) hr, (int) min, (int) sec, comma ? "," : ".", (int) msec);
+    return std::string(buf);
+}
+
+static std::string alignment_to_srt(const qwen3_asr::alignment_result & result) {
+    std::string srt = "";
+
+    for (size_t i = 0; i < result.words.size(); ++i) {
+        const auto & w = result.words[i];
+
+        char buf[64];
+        snprintf(buf, sizeof(buf), "%zu\n", i + 1);
+        srt += buf;
+
+        srt += to_timestamp(w.start, true) + " --> " + to_timestamp(w.end, true) + "\n";
+        srt += w.word + "\n\n";
+    }
+
+    return srt;
 }
 
 static std::string find_korean_dict(const std::string & model_path) {
@@ -337,17 +374,17 @@ static int run_alignment(const cli_params & params) {
         fprintf(stderr, "  Words aligned:   %zu\n", result.words.size());
     }
     
-    std::string json_output = alignment_to_json(result);
+    std::string string_output = params.output_srt ? alignment_to_srt(result) : alignment_to_json(result);
     
     if (params.output_path.empty()) {
-        printf("%s\n", json_output.c_str());
+        printf("%s\n", string_output.c_str());
     } else {
         std::ofstream out(params.output_path);
         if (!out) {
             fprintf(stderr, "Error: Failed to open output file: %s\n", params.output_path.c_str());
             return 1;
         }
-        out << json_output << "\n";
+        out << string_output << "\n";
         fprintf(stderr, "Output written to: %s\n", params.output_path.c_str());
     }
     
@@ -482,17 +519,17 @@ static int run_transcribe_and_align(const cli_params & params) {
         fprintf(stderr, "  Words aligned: %zu\n", align_result.words.size());
     }
 
-    std::string json_output = alignment_to_json(align_result);
+    std::string string_output = params.output_srt ? alignment_to_srt(align_result) : alignment_to_json(align_result);
 
     if (params.output_path.empty()) {
-        printf("%s\n", json_output.c_str());
+        printf("%s\n", string_output.c_str());
     } else {
         std::ofstream out(params.output_path);
         if (!out) {
             fprintf(stderr, "Error: Failed to open output file: %s\n", params.output_path.c_str());
             return 1;
         }
-        out << json_output << "\n";
+        out << string_output << "\n";
         fprintf(stderr, "Output written to: %s\n", params.output_path.c_str());
     }
 
