@@ -270,13 +270,19 @@ static std::string alignment_to_srt(const qwen3_asr::alignment_result & result) 
         while (i < result.words.size()) {
             const auto & w = result.words[i];
 
-            // Break if there is a long gap between words
-            if (word_count > 0 && (w.start - end_time > 1.0)) {
+            // Only break on pauses if the pause is very long (e.g. > 3 seconds) 
+            // OR if the pause is > 1.5 seconds AND the previous word ended a clause
+            bool is_end_of_clause = !text.empty() && 
+                (text.back() == ',' || text.back() == '.' || text.back() == '?' || text.back() == '!' ||
+                 text.find("\xEF\xBC\x8C") != std::string::npos || // ，
+                 text.find("\xE3\x80\x82") != std::string::npos);  // 。
+
+            if (word_count > 0 && (w.start - end_time > 3.0 || (w.start - end_time > 1.5 && is_end_of_clause))) {
                 break;
             }
 
             // For non-Asian languages, we usually need spaces between words
-            if (word_count > 0 && !text.empty() &&
+            if (word_count > 0 && !text.empty() && 
                 static_cast<unsigned char>(text.back()) < 0x80 &&
                 static_cast<unsigned char>(w.word.front()) < 0x80 &&
                 w.word.find_first_of(".,!?") != 0) {
@@ -284,25 +290,26 @@ static std::string alignment_to_srt(const qwen3_asr::alignment_result & result) 
             }
 
             text += w.word;
-            end_time = w.end;
+            // Update end time only if the word has a valid end time
+            if (w.end > end_time) {
+                end_time = w.end;
+            }
             word_count++;
             i++;
 
-            // Break on punctuation
+            // Break on terminal punctuation (sentences)
             if (w.word.find("\xE3\x80\x82") != std::string::npos || // 。
                 w.word.find("\xEF\xBC\x9F") != std::string::npos || // ？
                 w.word.find("\xEF\xBC\x81") != std::string::npos || // ！
-                w.word.find("\xEF\xBC\x8C") != std::string::npos || // ，
                 w.word.find(".") != std::string::npos ||
                 w.word.find("?") != std::string::npos ||
                 w.word.find("!") != std::string::npos ||
-                w.word.find(",") != std::string::npos ||
                 w.word.find("\n") != std::string::npos) {
                 break;
             }
 
-            // Break if sentence gets too long
-            if (word_count >= 15 || text.size() >= 45) {
+            // Break if sentence gets too long (prevent endless blocks)
+            if (word_count >= 20 || text.size() >= 80) {
                 break;
             }
         }
@@ -317,7 +324,6 @@ static std::string alignment_to_srt(const qwen3_asr::alignment_result & result) 
 
     return srt;
 }
-
 static std::string find_korean_dict(const std::string & model_path) {
     auto dir_of = [](const std::string & path) -> std::string {
         size_t pos = path.find_last_of("/\\");
@@ -467,68 +473,121 @@ static int run_transcribe_and_align(const cli_params & params) {
     fprintf(stderr, "  Threads: %d\n", params.n_threads);
     fprintf(stderr, "\n");
 
-    fprintf(stderr, "--- Phase 1: Transcription ---\n");
     qwen3_asr::Qwen3ASR asr;
     if (!asr.load_model(params.model_path)) {
         fprintf(stderr, "Error (ASR): %s\n", asr.get_error().c_str());
         return 1;
     }
 
-    qwen3_asr::transcribe_params tp;
-    tp.max_tokens = params.max_tokens;
-    tp.language = params.language;
-    tp.n_threads = params.n_threads;
-    tp.print_progress = params.print_progress;
-    tp.print_timing = params.print_timing;
-
-    auto asr_result = asr.transcribe(params.audio_path, tp);
-    if (!asr_result.success) {
-        fprintf(stderr, "Error (ASR): %s\n", asr_result.error_msg.c_str());
-        return 1;
-    }
-
-    std::string detected_lang = detect_language(asr_result.language);
-    std::string align_lang = params.language.empty() ? detected_lang : params.language;
-    std::string transcript = extract_transcript(asr_result.text);
-
-    fprintf(stderr, "  Detected language: %s\n", detected_lang.empty() ? "(none)" : detected_lang.c_str());
-    if (!params.language.empty()) {
-        fprintf(stderr, "  Language override: %s\n", params.language.c_str());
-    }
-    fprintf(stderr, "  Alignment language: %s\n", align_lang.empty() ? "(none)" : align_lang.c_str());
-    fprintf(stderr, "  Transcript: %s\n", transcript.c_str());
-
-    fprintf(stderr, "\n--- Phase 2: Forced Alignment ---\n");
     qwen3_asr::ForcedAligner aligner;
     if (!aligner.load_model(params.aligner_model_path)) {
         fprintf(stderr, "Error (Aligner): %s\n", aligner.get_error().c_str());
         return 1;
     }
 
-    if (align_lang == "korean") {
-        std::string dict_path = find_korean_dict(params.aligner_model_path);
-        if (dict_path.empty()) {
-            fprintf(stderr, "Warning: Korean dictionary not found. Falling back to whitespace splitting.\n");
-        } else if (!aligner.load_korean_dict(dict_path)) {
-            fprintf(stderr, "Warning: Failed to load Korean dictionary from %s\n", dict_path.c_str());
-        }
+    std::vector<float> all_samples;
+    int sample_rate;
+    if (!load_wav(params.audio_path, all_samples, sample_rate)) {
+        fprintf(stderr, "Error: Failed to load audio file: %s\n", params.audio_path.c_str());
+        return 1;
+    }
+    if (sample_rate != 16000) {
+        fprintf(stderr, "Error: Audio must be 16kHz\n");
+        return 1;
     }
 
-    auto align_result = aligner.align(params.audio_path, transcript, align_lang);
-    if (!align_result.success) {
-        fprintf(stderr, "Error (Aligner): %s\n", align_result.error_msg.c_str());
-        return 1;
+    const int chunk_size_samples = 30 * 16000;
+    const int chunk_stride_samples = 28 * 16000; // 2 seconds overlap
+    int n_chunks = (all_samples.size() > chunk_size_samples) 
+                   ? (all_samples.size() - chunk_size_samples + chunk_stride_samples - 1) / chunk_stride_samples + 1 
+                   : 1;
+
+    qwen3_asr::alignment_result full_align_result;
+    full_align_result.success = true;
+    full_align_result.t_total_ms = 0;
+    int64_t total_asr_ms = 0;
+    int64_t total_align_ms = 0;
+
+    std::string global_lang = params.language;
+
+    for (int c = 0; c < n_chunks; ++c) {
+        int start = c * chunk_stride_samples;
+        int end = std::min((int)all_samples.size(), start + chunk_size_samples);
+        int chunk_len = end - start;
+        
+        fprintf(stderr, "\n--- Processing Chunk %d/%d (%.2fs - %.2fs) ---\n", 
+                c + 1, n_chunks, start / 16000.0f, end / 16000.0f);
+
+        qwen3_asr::transcribe_params tp;
+        tp.max_tokens = params.max_tokens;
+        tp.language = global_lang;
+        tp.n_threads = params.n_threads;
+        tp.print_progress = params.print_progress;
+        tp.print_timing = params.print_timing;
+
+        auto asr_result = asr.transcribe(all_samples.data() + start, chunk_len, tp);
+        if (!asr_result.success) {
+            fprintf(stderr, "Error (ASR) in chunk %d: %s\n", c + 1, asr_result.error_msg.c_str());
+            continue;
+        }
+
+        std::string detected_lang = detect_language(asr_result.language);
+        if (global_lang.empty() && !detected_lang.empty()) {
+            global_lang = detected_lang;
+            if (global_lang == "korean") {
+                std::string dict_path = find_korean_dict(params.aligner_model_path);
+                if (!dict_path.empty()) aligner.load_korean_dict(dict_path);
+            }
+        }
+        
+        std::string align_lang = global_lang.empty() ? detected_lang : global_lang;
+        std::string transcript = extract_transcript(asr_result.text);
+        
+        fprintf(stderr, "  Detected language: %s\n", detected_lang.empty() ? "(none)" : detected_lang.c_str());
+        fprintf(stderr, "  Alignment language: %s\n", align_lang.empty() ? "(none)" : align_lang.c_str());
+        fprintf(stderr, "  Transcript: %s\n", transcript.c_str());
+        
+        if (transcript.empty()) continue;
+
+        auto align_result = aligner.align(all_samples.data() + start, chunk_len, transcript, align_lang);
+        if (!align_result.success) {
+            fprintf(stderr, "Error (Aligner) in chunk %d: %s\n", c + 1, align_result.error_msg.c_str());
+            continue;
+        }
+
+        float time_offset = start / 16000.0f;
+        
+        // Define strict ownership boundaries for this chunk based on the overlapping stride
+        double chunk_own_start = time_offset;
+        double chunk_own_end = (c == n_chunks - 1) ? 999999.0 : (time_offset + (chunk_stride_samples / 16000.0f));
+        
+        for (auto & w : align_result.words) {
+            double abs_start = w.start + time_offset;
+            double abs_end = w.end + time_offset;
+            
+            // Hard partitioning: This chunk only "owns" words that start within its active stride window.
+            // This prevents trailing truncated words (e.g. "For your.") in Chunk N from duplicating with Chunk N+1.
+            if (abs_start >= chunk_own_start && abs_start < chunk_own_end) {
+                w.start = abs_start;
+                w.end = abs_end;
+                full_align_result.words.push_back(w);
+            }
+        }
+        
+        total_asr_ms += asr_result.t_total_ms;
+        total_align_ms += align_result.t_total_ms;
+        full_align_result.t_total_ms += (asr_result.t_total_ms + align_result.t_total_ms);
     }
 
     if (params.print_timing) {
         fprintf(stderr, "\nCombined Timing:\n");
-        fprintf(stderr, "  ASR:           %lld ms\n", (long long) asr_result.t_total_ms);
-        fprintf(stderr, "  Alignment:     %lld ms\n", (long long) align_result.t_total_ms);
-        fprintf(stderr, "  Total:         %lld ms\n", (long long) (asr_result.t_total_ms + align_result.t_total_ms));
-        fprintf(stderr, "  Words aligned: %zu\n", align_result.words.size());
+        fprintf(stderr, "  ASR:           %lld ms\n", (long long) total_asr_ms);
+        fprintf(stderr, "  Alignment:     %lld ms\n", (long long) total_align_ms);
+        fprintf(stderr, "  Total:         %lld ms\n", (long long) full_align_result.t_total_ms);
+        fprintf(stderr, "  Words aligned: %zu\n", full_align_result.words.size());
     }
 
-    std::string string_output = params.output_srt ? alignment_to_srt(align_result) : alignment_to_json(align_result);
+    std::string string_output = params.output_srt ? alignment_to_srt(full_align_result) : alignment_to_json(full_align_result);
 
     if (params.output_path.empty()) {
         printf("%s\n", string_output.c_str());
